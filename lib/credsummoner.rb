@@ -1,0 +1,8 @@
+require 'credsummoner/config'
+require 'credsummoner/account'
+require 'credsummoner/role'
+require 'credsummoner/saml_assertion'
+require 'credsummoner/web'
+require 'credsummoner/okta/credentials'
+require 'credsummoner/okta/session'
+require 'credsummoner/okta/user'

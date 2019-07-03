@@ -1,0 +1,165 @@
+#!/usr/bin/env ruby
+
+require 'credsummoner'
+require 'optparse'
+require 'tty-prompt'
+
+duration = 12 * 60 * 60 # 12 hour session
+mode = :command
+region = ENV['AWS_REGION'] || 'us-east-1'
+account_name = nil
+role_name = nil
+
+root_parser = OptionParser.new do |opts|
+  opts.banner = "Usage: credsummoner SUBCOMMAND [OPTION ...]"
+end
+
+subcommands = {
+  'get' => OptionParser.new do |opts|
+    opts.banner = "Usage: credsummoner get USERNAME [OPTION ...] [COMMAND ...]
+
+Fetch temporary AWS tokens and do one of the following:
+
+* Print environment variables to stdout if --env is specified
+* Run COMMAND if specified
+* Otherwise, run default user shell
+"
+
+    opts.on('-d', '--duration=DURATION', 'the ttl of the session token in seconds') do |d|
+      duration = d
+    end
+
+    opts.on('-e', '--environment', 'display environment variables instead of running a command') do |e|
+      mode = :environment
+    end
+
+    opts.on('--region=REGION', 'AWS region') do |r|
+      region = r
+    end
+
+    opts.on('-a', '--account=ACCOUNT', 'AWS account alias') do |a|
+      account_name = a
+    end
+
+    opts.on('-r', '--role=ROLE', 'AWS role name') do |r|
+      role_name = r
+    end
+  end,
+  'config' => OptionParser.new do |opts|
+    opts.banner = 'Usage: credsummoner config KEY VALUE
+
+Set the configuration option KEY to VALUE.
+
+Available configuration keys:
+
+* okta_aws_embed_link: The embed link for the AWS application in Okta.
+This link can be found in the "General" tab when viewing the AWS
+application settings in the Okta admin interface.
+'
+  end
+}
+
+root_parser.order!
+subcommand = ARGV.shift
+subcommands[subcommand].parse!
+
+case subcommand
+when 'get'
+  username = ARGV[0]
+
+  unless username
+    puts 'username must be specified'
+    puts "see 'credsummoner --help'"
+    exit(1)
+  end
+
+  unless CredSummoner::Config.exists?
+    puts 'CredSummoner has not yet been configured'
+    puts "see 'credsummoner config --help'"
+    exit(1)
+  end
+
+  prompt = TTY::Prompt.new
+  user = CredSummoner::Okta::User.new(username) do
+    password = prompt.mask('password:')
+    totp_token = prompt.ask('TOTP token:')
+    CredSummoner::Okta::Credentials.new(password, totp_token)
+  end
+  account = if account_name
+              user.role_map.keys.find { |a| a.name == account_name } ||
+                begin
+                  puts "account '#{account_name}' is not a valid choice"
+                  puts 'available accounts:'
+                  user.role_map.keys.each do |acc|
+                    puts " - #{acc.name}"
+                  end
+                  exit(1)
+                end
+            else
+              prompt.select('which account?') do |menu|
+                user.role_map.keys.each do |account|
+                  menu.choice(account.to_s, account)
+                end
+              end
+            end
+  role = if role_name
+           user.role_map[account].find { |r| r.name == role_name } ||
+             begin
+               puts "role '#{role_name}' is not a valid choice"
+               puts 'available roles:'
+               user.role_map[account].each do |role|
+                 puts " - #{role.name}"
+               end
+               exit(1)
+             end
+         else
+           prompt.select('which role?') do |menu|
+             user.role_map[account].each do |role|
+               menu.choice(role.to_s, role)
+             end
+           end
+         end
+  credentials = user.assume_role(role, duration, region)
+
+  if mode == :command
+    command = if ARGV.length > 1
+                ARGV.drop(1)
+              else
+                # Default to user's preferred shell, falling back to bash.
+                [ENV['SHELL']] || ['bash']
+              end
+
+    # Fork and use exec to spawn a child process with the AWS session
+    # environment variables prepared.
+    pid = Process.fork do
+      ENV['AWS_ACCESS_KEY_ID'] = credentials[:access_key_id]
+      ENV['AWS_SECRET_ACCESS_KEY'] = credentials[:secret_access_key]
+      ENV['AWS_SESSION_TOKEN'] = credentials[:session_token]
+      # For decorating the shell prompt.
+      ENV['CREDSUMMONER_AWS_ROLE'] = "#{account.name}/#{role.name}"
+      STDERR.puts "session expires at #{credentials[:expiration]}"
+      exec(*command)
+    end
+
+    if pid
+      Process.waitpid(pid)
+      exit($?.exitstatus) # exit with status of child process
+    end
+  elsif mode == :environment
+    puts "export AWS_ACCESS_KEY_ID=\"#{credentials[:access_key_id]}\""
+    puts "export AWS_SECRET_ACCESS_KEY=\"#{credentials[:secret_access_key]}\""
+    puts "export AWS_SESSION_TOKEN=\"#{credentials[:session_token]}\""
+    puts "export CREDSUMMONER_AWS_ROLE=\"#{account.name}/#{role.name}\""
+    STDERR.puts "session expires at #{credentials[:expiration]}"
+  end
+when 'config'
+  key = ARGV[0]
+  value = ARGV[1]
+  config = if CredSummoner::Config.exists?
+             CredSummoner::Config.load
+           else
+             CredSummoner::Config.new
+           end
+  config.send("#{key}=", value)
+  config.save
+end
